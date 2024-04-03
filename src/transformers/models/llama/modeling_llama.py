@@ -38,7 +38,7 @@ from ...modeling_outputs import (
     QuestionAnsweringModelOutput,
     SequenceClassifierOutputWithPast,
 )
-from ...modeling_utils import PreTrainedModel
+from ...modeling_utils import PreTrainedModel, prune_linear_layer, find_pruneable_heads_and_indices
 from ...pytorch_utils import ALL_LAYERNORM_LAYERS
 from ...utils import (
     add_start_docstrings,
@@ -316,6 +316,29 @@ class LlamaAttention(nn.Module):
                 )
             else:
                 raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+
+    # Added by Bryson for structural pruning in LLama
+    def prune_heads(self, heads):
+        if len(heads) == 0:
+            return
+        heads, index = find_pruneable_heads_and_indices(
+            heads, self.num_heads, self.head_dim, self.pruned_heads
+        )
+        prune_size = index.shape[0]
+        # Prune linear layers
+        self.q_proj = prune_linear_layer(self.q_proj, index)
+        self.k_proj = prune_linear_layer(self.k_proj, index)
+        self.v_proj = prune_linear_layer(self.v_proj, index)
+
+
+        self.o_proj = prune_linear_layer(self.o_proj, index, dim=1)
+        # self.out_proj.dense = prune_linear_layer(self.out_proj.dense, index, dim=1)
+
+        # Update hyper params and store pruned heads
+        self.num_heads = self.num_heads - len(heads)
+        self.num_key_value_heads = self.num_key_value_heads - len(heads)
+        self.hidden_size = self.head_dim * self.num_heads
+        self.pruned_heads = self.pruned_heads.union(heads)
 
     def forward(
         self,
