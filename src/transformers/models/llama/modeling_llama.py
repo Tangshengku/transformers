@@ -38,7 +38,7 @@ from ...modeling_outputs import (
     TokenClassifierOutput,
 )
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS
-from ...modeling_utils import PreTrainedModel
+from ...modeling_utils import PreTrainedModel, prune_linear_layer, find_pruneable_heads_and_indices
 from ...pytorch_utils import ALL_LAYERNORM_LAYERS
 from ...utils import (
     add_start_docstrings,
@@ -312,7 +312,7 @@ class LlamaMLP(nn.Module):
         return down_proj
 
 
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int, index: Optional[torch.LongTensor] = None) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
     num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
@@ -321,7 +321,11 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     if n_rep == 1:
         return hidden_states
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+    hidden_states = hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+    # For pruned Llama3.1, we select corresponding matrix if Q is pruned.
+    if index is not None:
+        hidden_states = hidden_states.index_select(dim=1, index=index)
+    return hidden_states
 
 
 class LlamaAttention(nn.Module):
@@ -341,6 +345,8 @@ class LlamaAttention(nn.Module):
         self.attention_dropout = config.attention_dropout
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
+        import copy
+        self.ori_num_heads = copy.deepcopy(self.num_heads)
         self.head_dim = getattr(config, "head_dim", self.hidden_size // self.num_heads)
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
@@ -355,7 +361,66 @@ class LlamaAttention(nn.Module):
 
         # TODO (joao): remove in v4.45 (RoPE is computed in the model, not in the decoder layers)
         self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
+        self.pruned_heads = set()
+        self.pruned_kv_heads = set()
 
+    # Added by Bryson for structural pruning in LLama
+    # if kv_ignore = True, K and V will not be pruned. Applied in Llama3.1(GQA) pruning.
+    def prune_heads(self, heads, kv_ignore=False):
+        if len(heads) == 0:
+            return
+        heads, index = find_pruneable_heads_and_indices(
+            heads, self.num_heads, self.head_dim, self.pruned_heads
+        )
+        prune_size = index.shape[0]
+        # Prune linear layers
+        self.q_proj = prune_linear_layer(self.q_proj, index)
+        if not kv_ignore:
+            self.k_proj = prune_linear_layer(self.k_proj, index)
+            self.v_proj = prune_linear_layer(self.v_proj, index)
+        self.o_proj = prune_linear_layer(self.o_proj, index, dim=1)
+
+        # Update hyper params and store pruned heads
+        self.num_heads = self.num_heads - len(heads)
+        if not kv_ignore:
+            self.num_key_value_heads = self.num_key_value_heads - len(heads)
+        self.hidden_size = self.head_dim * self.num_heads
+        self.pruned_heads = self.pruned_heads.union(heads)
+    
+    # Structural Pruning for GQA, prune K,V and prune the corresponding weight group in Q and O
+    # The input heads are the pruned index in K and V 
+    # Note: Not Applied in DarwinLM experiments
+    def prune_group_heads(self, heads):
+        if len(heads) == 0:
+            return
+
+        heads, index = find_pruneable_heads_and_indices(
+            heads, self.num_key_value_heads, self.head_dim, self.pruned_kv_heads 
+        )
+        self.k_proj = prune_linear_layer(self.k_proj, index)
+        self.v_proj = prune_linear_layer(self.v_proj, index)
+
+        self.num_key_value_heads = self.num_key_value_heads - len(heads)
+        self.pruned_kv_heads = self.pruned_heads.union(heads)
+
+        q_o_heads = []
+        for head in heads:
+            for i in range(head * self.num_key_value_groups, head * self.num_key_value_groups + self.num_key_value_groups):
+                q_o_heads.append(i)
+        # print(q_o_heads)
+        heads, index = find_pruneable_heads_and_indices(
+            q_o_heads, self.num_heads, self.head_dim, self.pruned_heads 
+        )
+        # Prune linear layers
+        self.q_proj = prune_linear_layer(self.q_proj, index)
+        self.o_proj = prune_linear_layer(self.o_proj, index, dim=1)
+
+        # Update hyper params and store pruned heads
+        self.num_heads = self.num_heads - len(q_o_heads)
+        self.hidden_size = self.head_dim * self.num_heads
+        self.pruned_heads = self.pruned_heads.union(q_o_heads)
+
+    
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -413,8 +478,14 @@ class LlamaAttention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        remaining_head_index = []
+        for i in range(self.ori_num_heads):
+            if i not in self.pruned_heads:
+                remaining_head_index.append(i)
+        head_index_kv =  torch.tensor(remaining_head_index).long().to(key_states.device)
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups, index=head_index_kv)
+        value_states = repeat_kv(value_states, self.num_key_value_groups, index=head_index_kv)
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         if attention_mask is not None:  # no matter the length, we just slice it
@@ -513,6 +584,16 @@ class LlamaFlashAttention2(LlamaAttention):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
+        remaining_head_index = []
+        for i in range(self.ori_num_heads):
+            if i not in self.pruned_heads:
+                remaining_head_index.append(i)
+        head_index_kv =  torch.tensor(remaining_head_index).long().to(key_states.device)
+        # print(head_index_kv)
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups, index=head_index_kv)
+        value_states = repeat_kv(value_states, self.num_key_value_groups, index=head_index_kv)
+        
         # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
         # to be able to avoid many of these transpose/reshape/view.
         query_states = query_states.transpose(1, 2)
@@ -633,8 +714,14 @@ class LlamaSdpaAttention(LlamaAttention):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        remaining_head_index = []
+        for i in range(self.ori_num_heads):
+            if i not in self.pruned_heads:
+                remaining_head_index.append(i)
+        head_index_kv =  torch.tensor(remaining_head_index).long().to(key_states.device)
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups, index=head_index_kv)
+        value_states = repeat_kv(value_states, self.num_key_value_groups, index=head_index_kv)
 
         causal_mask = attention_mask
         if attention_mask is not None:
@@ -679,6 +766,7 @@ class LlamaDecoderLayer(nn.Module):
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.layer_idx = layer_idx
 
         self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
 
@@ -725,15 +813,16 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
+        # Modified for Time Profiling
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
+            hidden_states,
+            attention_mask,
+            position_ids,
+            past_key_value,
+            output_attentions,
+            use_cache,
+            cache_position,
+            position_embeddings,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -975,7 +1064,7 @@ class LlamaModel(LlamaPreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
 
-        for decoder_layer in self.layers:
+        for i, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -994,13 +1083,13 @@ class LlamaModel(LlamaPreTrainedModel):
             else:
                 layer_outputs = decoder_layer(
                     hidden_states,
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
+                    causal_mask,
+                    position_ids,
+                    past_key_values,
+                    output_attentions,
+                    use_cache,
+                    cache_position,
+                    position_embeddings,
                 )
 
             hidden_states = layer_outputs[0]
@@ -1018,6 +1107,7 @@ class LlamaModel(LlamaPreTrainedModel):
             all_hidden_states += (hidden_states,)
 
         next_cache = next_decoder_cache if use_cache else None
+        # return_legacy_cache = False
         if return_legacy_cache:
             next_cache = next_cache.to_legacy_cache()
 

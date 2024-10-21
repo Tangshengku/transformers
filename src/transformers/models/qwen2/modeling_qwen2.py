@@ -36,7 +36,7 @@ from ...modeling_outputs import (
     SequenceClassifierOutputWithPast,
     TokenClassifierOutput,
 )
-from ...modeling_utils import PreTrainedModel
+from ...modeling_utils import PreTrainedModel, prune_linear_layer, find_pruneable_heads_and_indices
 from ...utils import (
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
@@ -279,6 +279,63 @@ class Qwen2Attention(nn.Module):
             max_position_embeddings=self.max_position_embeddings,
             base=self.rope_theta,
         )
+        self.pruned_heads = set()
+        self.pruned_kv_heads = set()
+
+    # Added by Bryson for structural pruning in LLama
+    def prune_heads(self, heads, kv_ignore=False):
+        if len(heads) == 0:
+            return
+        heads, index = find_pruneable_heads_and_indices(
+            heads, self.num_heads, self.head_dim, self.pruned_heads
+        )
+        prune_size = index.shape[0]
+        # Prune linear layers
+        self.q_proj = prune_linear_layer(self.q_proj, index)
+        if not kv_ignore:
+            self.k_proj = prune_linear_layer(self.k_proj, index)
+            self.v_proj = prune_linear_layer(self.v_proj, index)
+            self.num_key_value_heads = self.num_key_value_heads - len(heads)
+        self.o_proj = prune_linear_layer(self.o_proj, index, dim=1)
+
+        # Update hyper params and store pruned heads
+        self.num_heads = self.num_heads - len(heads)
+        self.hidden_size = self.head_dim * self.num_heads
+        self.pruned_heads = self.pruned_heads.union(heads)
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+    
+    # Structural Pruning for GQA, prune K,V and prune the corresponding weight group in Q and O
+    # The input heads are the pruned index in K and V 
+    def prune_group_heads(self, heads):
+        if len(heads) == 0:
+            return
+
+        heads, index = find_pruneable_heads_and_indices(
+            heads, self.num_key_value_heads, self.head_dim, self.pruned_kv_heads 
+        )
+        self.k_proj = prune_linear_layer(self.k_proj, index)
+        self.v_proj = prune_linear_layer(self.v_proj, index)
+
+        self.num_key_value_heads = self.num_key_value_heads - len(heads)
+        self.pruned_kv_heads = self.pruned_heads.union(heads)
+
+        q_o_heads = []
+        for head in heads:
+            for i in range(head * self.num_key_value_groups, head * self.num_key_value_groups + self.num_key_value_groups):
+                q_o_heads.append(i)
+        # print(q_o_heads)
+        heads, index = find_pruneable_heads_and_indices(
+            q_o_heads, self.num_heads, self.head_dim, self.pruned_heads 
+        )
+        # Prune linear layers
+        self.q_proj = prune_linear_layer(self.q_proj, index)
+        self.o_proj = prune_linear_layer(self.o_proj, index, dim=1)
+
+        # Update hyper params and store pruned heads
+        self.num_heads = self.num_heads - len(q_o_heads)
+        self.hidden_size = self.head_dim * self.num_heads
+        self.pruned_heads = self.pruned_heads.union(q_o_heads)
+
 
     def forward(
         self,
@@ -654,13 +711,13 @@ class Qwen2DecoderLayer(nn.Module):
 
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
-            cache_position=cache_position,
+            hidden_states,
+            attention_mask,
+            position_ids,
+            past_key_value,
+            output_attentions,
+            use_cache,
+            cache_position,
         )
         hidden_states = residual + hidden_states
 
@@ -915,12 +972,12 @@ class Qwen2Model(Qwen2PreTrainedModel):
             else:
                 layer_outputs = decoder_layer(
                     hidden_states,
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
+                    causal_mask,
+                    position_ids,
+                    past_key_values,
+                    output_attentions,
+                    use_cache,
+                    cache_position,
                 )
 
             hidden_states = layer_outputs[0]
