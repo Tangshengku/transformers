@@ -225,7 +225,7 @@ class Qwen2MLP(nn.Module):
 
 
 # Copied from transformers.models.llama.modeling_llama.repeat_kv
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int, index: Optional[torch.LongTensor] = None) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
     num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
@@ -234,7 +234,11 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     if n_rep == 1:
         return hidden_states
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+    hidden_states = hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+    # For pruned Qwen, we select corresponding matrix if Q is pruned.
+    if index is not None:
+        hidden_states = hidden_states.index_select(dim=1, index=index)
+    return hidden_states
 
 
 class Qwen2Attention(nn.Module):
@@ -256,6 +260,8 @@ class Qwen2Attention(nn.Module):
 
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
+        import copy
+        self.ori_num_heads = copy.deepcopy(self.num_heads)
         self.head_dim = self.hidden_size // self.num_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
@@ -300,10 +306,10 @@ class Qwen2Attention(nn.Module):
 
         # Update hyper params and store pruned heads
         self.num_heads = self.num_heads - len(heads)
+        if not kv_ignore:
+            self.num_key_value_heads = self.num_key_value_heads - len(heads)
         self.hidden_size = self.head_dim * self.num_heads
         self.pruned_heads = self.pruned_heads.union(heads)
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-    
     # Structural Pruning for GQA, prune K,V and prune the corresponding weight group in Q and O
     # The input heads are the pruned index in K and V 
     def prune_group_heads(self, heads):
@@ -373,9 +379,15 @@ class Qwen2Attention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
+        remaining_head_index = []
+        for i in range(self.ori_num_heads):
+            if i not in self.pruned_heads:
+                remaining_head_index.append(i)
+        head_index_kv =  torch.tensor(remaining_head_index).long().to(key_states.device)
+
         # repeat k/v heads if n_kv_heads < n_heads
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        key_states = repeat_kv(key_states, self.num_key_value_groups, head_index_kv)
+        value_states = repeat_kv(value_states, self.num_key_value_groups, head_index_kv)
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
@@ -497,9 +509,14 @@ class Qwen2FlashAttention2(Qwen2Attention):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
+        remaining_head_index = []
+        for i in range(self.ori_num_heads):
+            if i not in self.pruned_heads:
+                remaining_head_index.append(i)
+        head_index_kv =  torch.tensor(remaining_head_index).long().to(key_states.device)
         # repeat k/v heads if n_kv_heads < n_heads
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        key_states = repeat_kv(key_states, self.num_key_value_groups, head_index_kv)
+        value_states = repeat_kv(value_states, self.num_key_value_groups, head_index_kv)
         dropout_rate = 0.0 if not self.training else self.attention_dropout
 
         # In PEFT, usually we cast the layer norms in float32 for training stability reasons
@@ -615,6 +632,12 @@ class Qwen2SdpaAttention(Qwen2Attention):
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        # remaining_head_index = []
+        # for i in range(self.ori_num_heads):
+        #     if i not in self.pruned_heads:
+        #         remaining_head_index.append(i)
+        # head_index_kv =  torch.tensor(remaining_head_index).long().to(key_states.device)
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)

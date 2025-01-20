@@ -372,7 +372,6 @@ class LlamaAttention(nn.Module):
         heads, index = find_pruneable_heads_and_indices(
             heads, self.num_heads, self.head_dim, self.pruned_heads
         )
-        prune_size = index.shape[0]
         # Prune linear layers
         self.q_proj = prune_linear_layer(self.q_proj, index)
         if not kv_ignore:
@@ -478,14 +477,28 @@ class LlamaAttention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        remaining_head_index = []
-        for i in range(self.ori_num_heads):
-            if i not in self.pruned_heads:
-                remaining_head_index.append(i)
-        head_index_kv =  torch.tensor(remaining_head_index).long().to(key_states.device)
-
-        key_states = repeat_kv(key_states, self.num_key_value_groups, index=head_index_kv)
-        value_states = repeat_kv(value_states, self.num_key_value_groups, index=head_index_kv)
+        # if self.num_key_value_heads == self.num_heads:
+        #     head_index_kv = None
+        # else:
+        #     remaining_head_index = []
+        #     for i in range(self.ori_num_heads):
+        #         if i not in self.pruned_heads:
+        #             remaining_head_index.append(i)
+        #     head_index_kv =  torch.tensor(remaining_head_index).long().to(key_states.device)
+        head_index_kv = None
+        # key_states = repeat_kv(key_states, self.num_key_value_groups, index=head_index_kv)
+        # value_states = repeat_kv(value_states, self.num_key_value_groups, index=head_index_kv)
+        if query_states.shape[1] != key_states.shape[1]:
+            num_q_heads = query_states.shape[1]
+            num_kv_heads = key_states.shape[1]
+            remaining_head_index = []
+            for i in range(self.ori_num_heads):
+                if i not in self.pruned_heads:
+                    remaining_head_index.append(i)
+            head_index_kv =  torch.tensor(remaining_head_index).long().to(key_states.device)
+            key_states = repeat_kv(key_states, self.num_key_value_groups, index=head_index_kv)
+            value_states = repeat_kv(value_states, self.num_key_value_groups, index=head_index_kv)
+        
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         if attention_mask is not None:  # no matter the length, we just slice it
@@ -579,20 +592,20 @@ class LlamaFlashAttention2(LlamaAttention):
             cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-        remaining_head_index = []
-        for i in range(self.ori_num_heads):
-            if i not in self.pruned_heads:
-                remaining_head_index.append(i)
-        head_index_kv =  torch.tensor(remaining_head_index).long().to(key_states.device)
-        # print(head_index_kv)
-
-        key_states = repeat_kv(key_states, self.num_key_value_groups, index=head_index_kv)
-        value_states = repeat_kv(value_states, self.num_key_value_groups, index=head_index_kv)
+        # if past_key_value is not None:
+        #     # sin and cos are specific to RoPE models; cache_position needed for the static cache
+        #     cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        #     key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+        if query_states.shape[1] != key_states.shape[1]:
+            num_q_heads = query_states.shape[1]
+            num_kv_heads = key_states.shape[1]
+            remaining_head_index = []
+            for i in range(self.ori_num_heads):
+                if i not in self.pruned_heads:
+                    remaining_head_index.append(i)
+            head_index_kv =  torch.tensor(remaining_head_index).long().to(key_states.device)
+            key_states = repeat_kv(key_states, self.num_key_value_groups, index=head_index_kv)
+            value_states = repeat_kv(value_states, self.num_key_value_groups, index=head_index_kv)
         
         # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
         # to be able to avoid many of these transpose/reshape/view.
@@ -709,20 +722,41 @@ class LlamaSdpaAttention(LlamaAttention):
             cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-        remaining_head_index = []
-        for i in range(self.ori_num_heads):
-            if i not in self.pruned_heads:
-                remaining_head_index.append(i)
-        head_index_kv =  torch.tensor(remaining_head_index).long().to(key_states.device)
-
-        key_states = repeat_kv(key_states, self.num_key_value_groups, index=head_index_kv)
-        value_states = repeat_kv(value_states, self.num_key_value_groups, index=head_index_kv)
-
+        # if past_key_value is not None:
+        #     # sin and cos are specific to RoPE models; cache_position needed for the static cache
+        #     cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        #     key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+        # if self.num_key_value_heads == self.num_heads:
+        #     head_index_kv = None
+        # else:
+        #     remaining_head_index = []
+        #     for i in range(self.ori_num_heads):
+        #         if i not in self.pruned_heads:
+        #             remaining_head_index.append(i)
+        #     head_index_kv =  torch.tensor(remaining_head_index).long().to(key_states.device)
+        # head_index_kv = None
+        # key_states = repeat_kv(key_states, self.num_key_value_groups, index=head_index_kv)
+        # value_states = repeat_kv(value_states, self.num_key_value_groups, index=head_index_kv)
+        if query_states.shape[1] != key_states.shape[1]:
+            num_q_heads = query_states.shape[1]
+            num_kv_heads = key_states.shape[1]
+            remaining_head_index = []
+            for i in range(self.ori_num_heads):
+                if i not in self.pruned_heads:
+                    remaining_head_index.append(i)
+            head_index_kv =  torch.tensor(remaining_head_index).long().to(key_states.device)
+            key_states = repeat_kv(key_states, self.num_key_value_groups, index=head_index_kv)
+            value_states = repeat_kv(value_states, self.num_key_value_groups, index=head_index_kv)
+            
+            # if num_q_heads > num_kv_heads:
+            #     # Repeat key and value states to cover all query heads
+            #     repeat_factor = num_q_heads // num_kv_heads  # Ceiling division
+            #     key_states = repeat_kv(key_states, repeat_factor)[:, :num_q_heads, :, :]
+            #     value_states = repeat_kv(value_states, repeat_factor)[:, :num_q_heads, :, :]
+            # else:
+            #     # Truncate key and value states to match query heads
+            #     key_states = key_states[:, :num_q_heads, :, :]
+            #     value_states = value_states[:, :num_q_heads, :, :]
         causal_mask = attention_mask
         if attention_mask is not None:
             causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
@@ -1107,7 +1141,7 @@ class LlamaModel(LlamaPreTrainedModel):
             all_hidden_states += (hidden_states,)
 
         next_cache = next_decoder_cache if use_cache else None
-        # return_legacy_cache = False
+        return_legacy_cache = False
         if return_legacy_cache:
             next_cache = next_cache.to_legacy_cache()
 
