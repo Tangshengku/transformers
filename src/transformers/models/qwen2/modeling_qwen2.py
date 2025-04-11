@@ -26,6 +26,7 @@ from ...modeling_outputs import (
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import Unpack
+from ...modeling_utils import PreTrainedModel, prune_linear_layer, find_pruneable_heads_and_indices
 from ...utils import (
     LossKwargs,
     add_code_sample_docstrings,
@@ -96,6 +97,23 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+# Copied from transformers.models.mistral.modeling_mistral.MistralMLP with Mistral->Qwen2
+class Qwen2MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, hidden_state):
+        return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
+
+
+# Copied from transformers.models.llama.modeling_llama.repeat_kv
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int, index: Optional[torch.LongTensor] = None) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
     num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
@@ -104,7 +122,11 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     if n_rep == 1:
         return hidden_states
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+    hidden_states = hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+    # For pruned Qwen, we select corresponding matrix if Q is pruned.
+    if index is not None:
+        hidden_states = hidden_states.index_select(dim=1, index=index)
+    return hidden_states
 
 
 def eager_attention_forward(
@@ -119,6 +141,154 @@ def eager_attention_forward(
 ):
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
+class Qwen2Attention(nn.Module):
+    """
+    Multi-headed attention from 'Attention Is All You Need' paper. Modified to use sliding window attention: Longformer
+    and "Generating Long Sequences with Sparse Transformers".
+    """
+
+    def __init__(self, config: Qwen2Config, layer_idx: Optional[int] = None):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        if layer_idx is None:
+            logger.warning_once(
+                f"Instantiating {self.__class__.__name__} without passing `layer_idx` is not recommended and will "
+                "to errors during the forward call, if caching is used. Please make sure to provide a `layer_idx` "
+                "when creating this class."
+            )
+
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        import copy
+        self.ori_num_heads = copy.deepcopy(self.num_heads)
+        self.head_dim = self.hidden_size // self.num_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.max_position_embeddings = config.max_position_embeddings
+        self.rope_theta = config.rope_theta
+        self.is_causal = True
+        self.attention_dropout = config.attention_dropout
+
+        if (self.head_dim * self.num_heads) != self.hidden_size:
+            raise ValueError(
+                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
+                f" and `num_heads`: {self.num_heads})."
+            )
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=True)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+
+        self.rotary_emb = Qwen2RotaryEmbedding(
+            self.head_dim,
+            max_position_embeddings=self.max_position_embeddings,
+            base=self.rope_theta,
+        )
+        self.pruned_heads = set()
+        self.pruned_kv_heads = set()
+
+    # Added by Bryson for structural pruning in LLama
+    def prune_heads(self, heads, kv_ignore=False):
+        if len(heads) == 0:
+            return
+        heads, index = find_pruneable_heads_and_indices(
+            heads, self.num_heads, self.head_dim, self.pruned_heads
+        )
+        prune_size = index.shape[0]
+        # Prune linear layers
+        self.q_proj = prune_linear_layer(self.q_proj, index)
+        if not kv_ignore:
+            self.k_proj = prune_linear_layer(self.k_proj, index)
+            self.v_proj = prune_linear_layer(self.v_proj, index)
+            self.num_key_value_heads = self.num_key_value_heads - len(heads)
+        self.o_proj = prune_linear_layer(self.o_proj, index, dim=1)
+
+        # Update hyper params and store pruned heads
+        self.num_heads = self.num_heads - len(heads)
+        if not kv_ignore:
+            self.num_key_value_heads = self.num_key_value_heads - len(heads)
+        self.hidden_size = self.head_dim * self.num_heads
+        self.pruned_heads = self.pruned_heads.union(heads)
+    # Structural Pruning for GQA, prune K,V and prune the corresponding weight group in Q and O
+    # The input heads are the pruned index in K and V 
+    def prune_group_heads(self, heads):
+        if len(heads) == 0:
+            return
+
+        heads, index = find_pruneable_heads_and_indices(
+            heads, self.num_key_value_heads, self.head_dim, self.pruned_kv_heads 
+        )
+        self.k_proj = prune_linear_layer(self.k_proj, index)
+        self.v_proj = prune_linear_layer(self.v_proj, index)
+
+        self.num_key_value_heads = self.num_key_value_heads - len(heads)
+        self.pruned_kv_heads = self.pruned_heads.union(heads)
+
+        q_o_heads = []
+        for head in heads:
+            for i in range(head * self.num_key_value_groups, head * self.num_key_value_groups + self.num_key_value_groups):
+                q_o_heads.append(i)
+        # print(q_o_heads)
+        heads, index = find_pruneable_heads_and_indices(
+            q_o_heads, self.num_heads, self.head_dim, self.pruned_heads 
+        )
+        # Prune linear layers
+        self.q_proj = prune_linear_layer(self.q_proj, index)
+        self.o_proj = prune_linear_layer(self.o_proj, index, dim=1)
+
+        # Update hyper params and store pruned heads
+        self.num_heads = self.num_heads - len(q_o_heads)
+        self.hidden_size = self.head_dim * self.num_heads
+        self.pruned_heads = self.pruned_heads.union(q_o_heads)
+
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        kv_seq_len = key_states.shape[-2]
+        if past_key_value is not None:
+            if self.layer_idx is None:
+                raise ValueError(
+                    f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
+                    "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
+                    "with a layer index."
+                )
+            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+        if past_key_value is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        if query_states.shape[1] != key_states.shape[1]:
+            num_q_heads = query_states.shape[1]
+            num_kv_heads = key_states.shape[1]
+            remaining_head_index = []
+            for i in range(self.ori_num_heads):
+                if i not in self.pruned_heads:
+                    remaining_head_index.append(i)
+            head_index_kv =  torch.tensor(remaining_head_index).long().to(key_states.device)
+            key_states = repeat_kv(key_states, self.num_key_value_groups, index=head_index_kv)
+            value_states = repeat_kv(value_states, self.num_key_value_groups, index=head_index_kv)
 
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
     if attention_mask is not None:
@@ -175,6 +345,46 @@ class Qwen2Attention(nn.Module):
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         sliding_window = None
+        if query_states.shape[1] != key_states.shape[1]:
+            num_q_heads = query_states.shape[1]
+            num_kv_heads = key_states.shape[1]
+            remaining_head_index = []
+            for i in range(self.ori_num_heads):
+                if i not in self.pruned_heads:
+                    remaining_head_index.append(i)
+            head_index_kv =  torch.tensor(remaining_head_index).long().to(key_states.device)
+            key_states = repeat_kv(key_states, self.num_key_value_groups, index=head_index_kv)
+            value_states = repeat_kv(value_states, self.num_key_value_groups, index=head_index_kv)
+        dropout_rate = 0.0 if not self.training else self.attention_dropout
+
+        # In PEFT, usually we cast the layer norms in float32 for training stability reasons
+        # therefore the input hidden states gets silently casted in float32. Hence, we need
+        # cast them back in float16 just to be sure everything works as expected.
+        input_dtype = query_states.dtype
+        if input_dtype == torch.float32:
+            if torch.is_autocast_enabled():
+                target_dtype = torch.get_autocast_gpu_dtype()
+            # Handle the case where the model is quantized
+            elif hasattr(self.config, "_pre_quantization_dtype"):
+                target_dtype = self.config._pre_quantization_dtype
+            else:
+                target_dtype = self.q_proj.weight.dtype
+
+            logger.warning_once(
+                f"The input hidden states seems to be silently casted in float32, this might be related to"
+                f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
+                f" {target_dtype}."
+            )
+
+            query_states = query_states.to(target_dtype)
+            key_states = key_states.to(target_dtype)
+            value_states = value_states.to(target_dtype)
+
+        # Reashape to the expected shape for Flash Attention
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+
         if (
             self.config.use_sliding_window
             and getattr(self.config, "sliding_window", None) is not None
@@ -229,6 +439,117 @@ class Qwen2RMSNorm(nn.Module):
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights, past_key_value
+
+
+# Copied from transformers.models.mixtral.modeling_mixtral.MixtralSdpaAttention with Mixtral->Qwen2
+class Qwen2SdpaAttention(Qwen2Attention):
+    """
+    Qwen2 attention module using torch.nn.functional.scaled_dot_product_attention. This module inherits from
+    `Qwen2Attention` as the weights of the module stays untouched. The only changes are on the forward pass to adapt to
+    SDPA API.
+    """
+
+    # Adapted from Qwen2Attention.forward
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        if output_attentions:
+            # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
+            logger.warning_once(
+                "Qwen2Model is using Qwen2SdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
+                'but specifying the manual implementation will be required from Transformers version v5.0.0 onwards. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+            )
+            return super().forward(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+            )
+
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        kv_seq_len = key_states.shape[-2]
+        if past_key_value is not None:
+            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+        # if past_key_value is not None:
+        #     cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
+        #     key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        if query_states.shape[1] != key_states.shape[1]:
+            num_q_heads = query_states.shape[1]
+            num_kv_heads = key_states.shape[1]
+            remaining_head_index = []
+            for i in range(self.ori_num_heads):
+                if i not in self.pruned_heads:
+                    remaining_head_index.append(i)
+            head_index_kv =  torch.tensor(remaining_head_index).long().to(key_states.device)
+            key_states = repeat_kv(key_states, self.num_key_value_groups, index=head_index_kv)
+            value_states = repeat_kv(value_states, self.num_key_value_groups, index=head_index_kv)
+
+        causal_mask = attention_mask
+        if attention_mask is not None:  # no matter the length, we just slice it
+            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+
+        # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
+        # Reference: https://github.com/pytorch/pytorch/issues/112577.
+        if query_states.device.type == "cuda" and attention_mask is not None:
+            query_states = query_states.contiguous()
+            key_states = key_states.contiguous()
+            value_states = value_states.contiguous()
+
+        # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
+        # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
+        # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a causal mask in case q_len == 1.
+        is_causal = True if causal_mask is None and q_len > 1 else False
+
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=causal_mask,
+            dropout_p=self.attention_dropout if self.training else 0.0,
+            is_causal=is_causal,
+        )
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(bsz, q_len, self.hidden_size)
+
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output, None, past_key_value
+
+
+QWEN2_ATTENTION_CLASSES = {
+    "eager": Qwen2Attention,
+    "flash_attention_2": Qwen2FlashAttention2,
+    "sdpa": Qwen2SdpaAttention,
+}
+
 
 class Qwen2DecoderLayer(nn.Module):
     def __init__(self, config: Qwen2Config, layer_idx: int):
@@ -270,6 +591,14 @@ class Qwen2DecoderLayer(nn.Module):
             cache_position=cache_position,
             position_embeddings=position_embeddings,
             **kwargs,
+        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+            hidden_states,
+            attention_mask,
+            position_ids,
+            past_key_value,
+            output_attentions,
+            use_cache,
+            cache_position,
         )
         hidden_states = residual + hidden_states
 
@@ -557,6 +886,12 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
                     **flash_attn_kwargs,
+                    causal_mask,
+                    position_ids,
+                    past_key_values,
+                    output_attentions,
+                    use_cache,
+                    cache_position,
                 )
 
             hidden_states = layer_outputs[0]
