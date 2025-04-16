@@ -484,7 +484,7 @@ class LlamaFlashAttention2(LlamaAttention):
                 attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         attn_output, attn_weights = attention_interface(
-            self,
+            self,)
         # if past_key_value is not None:
         #     # sin and cos are specific to RoPE models; cache_position needed for the static cache
         #     cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
@@ -545,13 +545,6 @@ class LlamaFlashAttention2(LlamaAttention):
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-            q_len,
-            position_ids=position_ids,
-            dropout=dropout_rate,
-            sliding_window=getattr(self, "sliding_window", None),
-            use_top_left_mask=self._flash_attn_uses_top_left_mask,
-            is_causal=self.is_causal,
-        )
 
         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
         attn_output = self.o_proj(attn_output)
